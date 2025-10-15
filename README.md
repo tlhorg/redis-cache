@@ -13,7 +13,7 @@ A simple and efficient Redis cache client for Go applications, providing a clean
 ## Installation
 
 ```bash
-go get github.com/pnlinh/redis-cache
+go get github.com/tlhorg/redis-cache
 ```
 
 ## Prerequisites
@@ -30,7 +30,7 @@ import (
     "log"
     "time"
 
-    "github.com/pnlinh/redis-cache"
+    "github.com/tlhorg/redis-cache"
 )
 
 func main() {
