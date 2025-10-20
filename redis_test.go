@@ -24,7 +24,7 @@ func TestRedisCache_Set(t *testing.T) {
 		mock.AnythingOfType("string"),
 		mock.AnythingOfType("string"),
 		mock.AnythingOfType("time.Duration")).Return(nil)
-	err := cache.Set("key", "value", time.Minute*1)
+	err := cache.Set("key", "value", time.Minute)
 	require.NoError(t, err)
 	cache.AssertExpectations(t)
 }
