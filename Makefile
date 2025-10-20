@@ -11,3 +11,6 @@ clean:
 
 upgrade:
 	go get -u all
+
+test:
+	go test -v ./...
