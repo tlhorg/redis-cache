@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Build and test on both the minimum version go.mod declares and a current
+  # release, so the `go` directive stays an honest claim.
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The suite runs against miniredis in-process, so no Redis service is needed.
+      - name: Test
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage
+        run: go tool cover -func=coverage.out
+
+  # Formatting, linting and vulnerability scanning are properties of the source,
+  # not of any one toolchain, so they run once on a current release.
+  #
+  # Deliberately NOT go-version-file: go.mod. That directive is the minimum
+  # version consumers need, and pinning the scan to it makes govulncheck report
+  # every unpatched CVE in an end-of-life standard library.
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # Installed from the module proxy at a pinned version so the download is
+      # checksum-verified, rather than piping an install script into a shell.
+      - name: Lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          golangci-lint run
+
+      - name: Vulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
