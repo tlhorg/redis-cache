@@ -1,2 +1,7 @@
 # Coverage artifacts from `make cover` / CI
 coverage.out
+
+# CLAUDE.md is contributor documentation and belongs in the repo. Many people
+# ignore it globally via core.excludesFile; a repo .gitignore takes precedence
+# over that, so this negation keeps it tracked for everyone.
+!CLAUDE.md
