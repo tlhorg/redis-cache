@@ -2,12 +2,57 @@ package cache
 
 import (
 	"context"
+	"errors"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
+
+// markerHook appends "<name>:<command>" to a shared log as each command enters
+// it, so tests can assert both that Options.Hooks is wired into the client and
+// in which order the hooks see a call.
+type markerHook struct {
+	name string
+	mu   *sync.Mutex
+	log  *[]string
+}
+
+func (h markerHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h markerHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.mu.Lock()
+		*h.log = append(*h.log, h.name+":"+cmd.Name())
+		h.mu.Unlock()
+
+		return next(ctx, cmd)
+	}
+}
+
+func (h markerHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// hooksFor returns the names of the hooks that saw cmd, in the order they saw
+// it. Filtering by command keeps these tests off go-redis's connection
+// handshake, which also runs through the hooks (RESP3 sends HELLO on dial).
+func hooksFor(log []string, cmd string) []string {
+	var names []string
+
+	for _, entry := range log {
+		if name, ok := strings.CutSuffix(entry, ":"+cmd); ok {
+			names = append(names, name)
+		}
+	}
+
+	return names
+}
 
 // newTestCache starts an in-process Redis and returns a cache connected to it.
 func newTestCache(t *testing.T) (*RedisCache, *miniredis.Miniredis) {
@@ -36,8 +81,18 @@ func TestSetRejectsNegativeTTL(t *testing.T) {
 	c, s := newTestCache(t)
 
 	err := c.Set(t.Context(), "key", "value", -5*time.Second)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidArgument)
 	require.False(t, s.Exists("key"), "rejected Set must not write the key")
+}
+
+// Redis expiry is millisecond-granular, so go-redis rounds a sub-millisecond
+// ttl up rather than dropping it. Pinned because the alternative — truncation
+// to zero — would mean "no expiry at all".
+func TestSetSubMillisecondTTLRoundsUpToOneMillisecond(t *testing.T) {
+	c, s := newTestCache(t)
+
+	require.NoError(t, c.Set(t.Context(), "tiny", "value", 500*time.Microsecond))
+	require.Equal(t, time.Millisecond, s.TTL("tiny"))
 }
 
 func TestSetKeepTTLRetainsExpiry(t *testing.T) {
@@ -185,11 +240,15 @@ func TestServerFailureIsNotReportedAsMiss(t *testing.T) {
 
 	require.Error(t, c.Set(ctx, "key", "value", 0))
 	require.Error(t, c.Del(ctx, "key"))
+
+	// A transport failure is not a caller mistake, so a retry wrapper keying on
+	// ErrInvalidArgument must not swallow it.
+	require.NotErrorIs(t, err, ErrInvalidArgument)
 }
 
 func TestNewRequiresAddr(t *testing.T) {
 	_, err := New(t.Context(), Options{})
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidArgument)
 }
 
 func TestNewFailsAgainstDeadAddress(t *testing.T) {
@@ -255,6 +314,82 @@ func TestNewSelectsDB(t *testing.T) {
 
 	s.Select(0)
 	require.False(t, s.Exists("key"))
+}
+
+// Instrumentation is the reason Options.Instrument exists, so assert the hook it
+// registers both reaches the client and sees the constructor's own PING — a
+// connect that fails should be visible to tracing, not invisible because
+// instrumentation lands afterwards.
+func TestInstrumentAppliesBeforePing(t *testing.T) {
+	s := miniredis.RunT(t)
+
+	var mu sync.Mutex
+	var log []string
+
+	c, err := New(t.Context(), Options{
+		Addr: s.Addr(),
+		Instrument: func(rdb *redis.Client) error {
+			rdb.AddHook(markerHook{name: "h", mu: &mu, log: &log})
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.Set(t.Context(), "key", "value", 0))
+
+	mu.Lock()
+	got := slices.Clone(log)
+	mu.Unlock()
+
+	require.Equal(t, []string{"h"}, hooksFor(got, "ping"))
+	require.Equal(t, []string{"h"}, hooksFor(got, "set"))
+	require.Equal(t, "h:ping", got[0], "instrumentation must precede the connection check")
+}
+
+func TestInstrumentErrorFailsConstruction(t *testing.T) {
+	s := miniredis.RunT(t)
+
+	sentinel := errors.New("instrumentation exploded")
+
+	_, err := New(t.Context(), Options{
+		Addr:       s.Addr(),
+		Instrument: func(*redis.Client) error { return sentinel },
+	})
+	require.ErrorIs(t, err, sentinel)
+}
+
+func TestNewFromURLAppliesInstrument(t *testing.T) {
+	s := miniredis.RunT(t)
+
+	var mu sync.Mutex
+	var log []string
+
+	c, err := NewFromURL(t.Context(), "redis://"+s.Addr()+"/0",
+		func(rdb *redis.Client) error {
+			rdb.AddHook(markerHook{name: "h", mu: &mu, log: &log})
+			return nil
+		})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	mu.Lock()
+	got := slices.Clone(log)
+	mu.Unlock()
+
+	require.Equal(t, []string{"h"}, hooksFor(got, "ping"))
+}
+
+// A nil Instrumenter is the zero value of Options.Instrument, so it must be
+// skipped rather than called.
+func TestNilInstrumenterIsSkipped(t *testing.T) {
+	s := miniredis.RunT(t)
+
+	c, err := NewFromURL(t.Context(), "redis://"+s.Addr()+"/0", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.Set(t.Context(), "key", "value", 0))
 }
 
 func TestCloseIsSafeToCallTwice(t *testing.T) {
