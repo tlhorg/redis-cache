@@ -17,6 +17,15 @@ import (
 // costs no allocation.
 var ErrCacheMiss = errors.New("cache: key not found")
 
+// ErrInvalidArgument is returned when a call is rejected before it reaches
+// Redis, because the arguments themselves are wrong: a missing Addr, or a
+// negative ttl that is not KeepTTL.
+//
+// It exists so a caller can distinguish its own bug from an outage. A retry or
+// circuit breaker should never retry an ErrInvalidArgument — the same arguments
+// will fail the same way — whereas a transport error is worth retrying.
+var ErrInvalidArgument = errors.New("cache: invalid argument")
+
 // KeepTTL can be passed as the ttl argument to Set to keep the key's existing
 // expiry. It is re-exported so callers need not import go-redis directly.
 const KeepTTL = redis.KeepTTL
@@ -40,7 +49,28 @@ type Options struct {
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+
+	// Instrument, if non-nil, is the seam for tracing and metrics. See
+	// Instrumenter.
+	Instrument Instrumenter
 }
+
+// Instrumenter is handed the underlying go-redis client during construction,
+// before the connection-verifying PING, so instrumentation also covers that
+// PING and a failed connect is visible to tracing rather than happening behind
+// it.
+//
+// It takes the client rather than a redis.Hook because that is what the
+// instrumentation libraries want: redisotel.InstrumentTracing and
+// InstrumentMetrics are func(redis.UniversalClient, ...) error and register
+// their hooks themselves. A plain hook still works:
+//
+//	func(rdb *redis.Client) error { rdb.AddHook(myHook{}); return nil }
+//
+// Returning an error fails construction and closes the pool. This is the only
+// place the client escapes; nothing in this package emits traces, metrics or
+// logs on its own.
+type Instrumenter func(*redis.Client) error
 
 // RedisCache is a Cache backed by a Redis server.
 type RedisCache struct {
@@ -53,7 +83,7 @@ var _ Cache = (*RedisCache)(nil)
 // The returned cache owns its connection pool; call Close when done with it.
 func New(ctx context.Context, opts Options) (*RedisCache, error) {
 	if opts.Addr == "" {
-		return nil, errors.New("cache: Addr is required")
+		return nil, fmt.Errorf("%w: Addr is required", ErrInvalidArgument)
 	}
 
 	return newCache(ctx, &redis.Options{
@@ -64,21 +94,22 @@ func New(ctx context.Context, opts Options) (*RedisCache, error) {
 		DialTimeout:  opts.DialTimeout,
 		ReadTimeout:  opts.ReadTimeout,
 		WriteTimeout: opts.WriteTimeout,
-	})
+	}, opts.Instrument)
 }
 
 // NewFromURL connects using a Redis connection string, for example
-// "redis://user:pass@localhost:6379/0".
-func NewFromURL(ctx context.Context, url string) (*RedisCache, error) {
+// "redis://user:pass@localhost:6379/0". The optional instrument argument is
+// applied exactly as Options.Instrument is by New.
+func NewFromURL(ctx context.Context, url string, instrument ...Instrumenter) (*RedisCache, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("cache: parse url: %w", err)
 	}
 
-	return newCache(ctx, opts)
+	return newCache(ctx, opts, instrument...)
 }
 
-func newCache(ctx context.Context, opts *redis.Options) (*RedisCache, error) {
+func newCache(ctx context.Context, opts *redis.Options, instrument ...Instrumenter) (*RedisCache, error) {
 	// go-redis defaults this to false, in which case baseClient.context()
 	// replaces the caller's context with context.Background() before the socket
 	// read/write — silently discarding every deadline and making the ctx
@@ -86,6 +117,20 @@ func newCache(ctx context.Context, opts *redis.Options) (*RedisCache, error) {
 	opts.ContextTimeoutEnabled = true
 
 	rdb := redis.NewClient(opts)
+
+	// Before the PING, so the connection check is instrumented like any other
+	// call rather than slipping past the hooks.
+	for _, fn := range instrument {
+		if fn == nil {
+			continue
+		}
+
+		if err := fn(rdb); err != nil {
+			// Don't leak the pool we just created.
+			_ = rdb.Close()
+			return nil, fmt.Errorf("cache: instrument: %w", err)
+		}
+	}
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		// Don't leak the pool we just created.
@@ -113,7 +158,13 @@ func (c *RedisCache) Get(ctx context.Context, key string) (string, error) {
 }
 
 // Set stores value at key. A ttl of zero means the key does not expire; pass
-// KeepTTL to retain the key's existing expiry.
+// KeepTTL to retain the key's existing expiry. A negative ttl that is not
+// KeepTTL is rejected with ErrInvalidArgument.
+//
+// Redis expiry has millisecond resolution. A ttl in (0, 1ms) is rounded up to
+// 1ms by go-redis, which also reports the rounding through its process-global
+// logger — the one case where a call here can produce output on stderr. Use
+// redis.SetLogger from your application to redirect it.
 //
 // value must be a type go-redis can marshal: string, []byte, a numeric type,
 // bool, time.Time, time.Duration, or an encoding.BinaryMarshaler. Anything else
@@ -123,7 +174,7 @@ func (c *RedisCache) Set(ctx context.Context, key string, value any, ttl time.Du
 	// other negative duration would silently store the key with no expiry at
 	// all. Reject it rather than persist data the caller meant to expire.
 	if ttl < 0 && ttl != KeepTTL {
-		return fmt.Errorf("cache: set %s: negative ttl %s", key, ttl)
+		return fmt.Errorf("%w: set %s: negative ttl %s", ErrInvalidArgument, key, ttl)
 	}
 
 	if err := c.client.Set(ctx, key, value, ttl).Err(); err != nil {
